@@ -1,5 +1,6 @@
 package com.redis;
 
+import com.redis.cluster.ClusterConfig;
 import com.redis.core.CommandProcessor;
 import com.redis.core.DataStore;
 import com.redis.network.Server;
@@ -64,10 +65,22 @@ public class Main {
         Path walPath = Path.of(config.getProperty("wal.path"));
         Path snapshotPath = Path.of(config.getProperty("snapshot.path"));
 
+        // ===== Phase 5: cluster topology =====
+        // ClusterConfig.fromProperties reads this node's cluster.self/
+        // cluster.nodes lines (see config/node1.properties etc.) and
+        // builds the full slot-ownership picture. We build it BEFORE
+        // CommandProcessor because CommandProcessor's constructor needs
+        // it — every command that has a key gets checked against this
+        // from now on.
+        ClusterConfig clusterConfig = ClusterConfig.fromProperties(config);
+        ClusterConfig.NodeInfo self = clusterConfig.self();
+        logger.info("Cluster node '{}' owns slots {}-{} ({}:{})",
+                self.id(), self.slotStart(), self.slotEnd(), self.host(), self.port());
+
         DataStore dataStore = new DataStore();
         SnapshotManager snapshotManager = new SnapshotManager(snapshotPath);
         WriteAheadLog wal = new WriteAheadLog(walPath);
-        CommandProcessor commandProcessor = new CommandProcessor(dataStore);
+        CommandProcessor commandProcessor = new CommandProcessor(dataStore, clusterConfig);
 
         logger.info("Loading snapshot from {}", snapshotPath);
         snapshotManager.loadInto(dataStore);

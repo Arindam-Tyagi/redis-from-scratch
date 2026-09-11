@@ -1,5 +1,7 @@
 package com.redis.core;
 
+import com.redis.cluster.ClusterConfig;
+
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.LinkedList;
@@ -31,9 +33,48 @@ public class CommandProcessor {
 
     private final DataStore dataStore;
 
+    /**
+     * The cluster's topology and this node's place in it (Phase 5) — or
+     * `null` when running WITHOUT clustering. We deliberately allow null
+     * here rather than making it required, via the two-constructor pattern
+     * below: every existing test (CommandProcessorTest and friends) builds
+     * a CommandProcessor with just a DataStore, expecting plain
+     * single-node behavior, and there's no reason to force all of them to
+     * also construct a full ClusterConfig just to test unrelated logic
+     * like HSET or LPUSH. Every place below that USES clusterConfig checks
+     * for null first and simply skips the cluster-ownership check when
+     * it's absent — "no cluster config" means "this node owns everything."
+     */
+    private final ClusterConfig clusterConfig;
+
+    /** Single-node mode: no cluster awareness at all. */
     public CommandProcessor(DataStore dataStore) {
-        this.dataStore = dataStore;
+        this(dataStore, null);
     }
+
+    /** Cluster mode: commands for a key this node doesn't own get redirected. */
+    public CommandProcessor(DataStore dataStore, ClusterConfig clusterConfig) {
+        this.dataStore = dataStore;
+        this.clusterConfig = clusterConfig;
+    }
+
+    /**
+     * Commands that do NOT take a key as their first argument, and
+     * therefore should never be checked against cluster ownership. PING is
+     * the only one we've built so far — every other command's first
+     * argument is always the key it operates on.
+     *
+     * NOTE ON MULTI-KEY COMMANDS (DEL, EXISTS): both accept MULTIPLE keys
+     * (e.g. "DEL a b c"), but for simplicity we only check ownership of
+     * the FIRST key listed. Real Redis Cluster actually REJECTS a
+     * multi-key command whose keys span more than one node (a "CROSSSLOT"
+     * error) — implementing that fully would mean checking every key in
+     * the command, not just the first. We're keeping this simpler for now
+     * since our test/demo usage always calls DEL/EXISTS with keys that
+     * belong together anyway; a stricter, fully correct check would be a
+     * reasonable Phase 10 polish item.
+     */
+    private static final Set<String> NO_KEY_COMMANDS = Set.of("PING");
 
     /**
      * Every command name that MUTATES DataStore in some way. ClientHandler
@@ -94,6 +135,33 @@ public class CommandProcessor {
         // efficient here because every command method below only reads
         // from `arguments`, never mutates it.
         List<String> arguments = args.subList(1, args.size());
+
+        // ===== Phase 5: cluster ownership check =====
+        // Runs BEFORE the switch below, so a misrouted command never
+        // touches DataStore at all - not even to read it. If this node
+        // isn't the owner, we don't process the command in any way; we
+        // just tell the client where the real owner is and let THEM
+        // re-send it there.
+        //
+        // clusterConfig == null means single-node mode (no cluster at
+        // all) - skip this check entirely in that case, same as if this
+        // node owned every key.
+        if (clusterConfig != null && !NO_KEY_COMMANDS.contains(commandName) && !arguments.isEmpty()) {
+            String key = arguments.get(0);
+            int slot = clusterConfig.computeSlot(key);
+            ClusterConfig.NodeInfo owner = clusterConfig.ownerOf(slot);
+            if (!owner.id().equals(clusterConfig.self().id())) {
+                // RESP error replies can't contain a literal newline, so
+                // this has to stay a single line. Real Redis's own MOVED
+                // reply has exactly this shape: "MOVED <slot> <host>:<port>"
+                // - a real redis-cli in cluster mode (`redis-cli -c`)
+                // recognizes this exact prefix and automatically
+                // reconnects to <host>:<port> and retries the command
+                // there, completely transparently to whoever typed the
+                // command.
+                return CommandResult.error("MOVED " + slot + " " + owner.host() + ":" + owner.port());
+            }
+        }
 
         try {
             // A `switch` EXPRESSION (Java 14+; different from the older
