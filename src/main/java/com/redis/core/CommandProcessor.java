@@ -35,6 +35,41 @@ public class CommandProcessor {
     }
 
     /**
+     * Every command name that MUTATES DataStore in some way. ClientHandler
+     * (Phase 3, next file) needs this so it can log a command to the
+     * WriteAheadLog BEFORE handing it to process() — logging read-only
+     * commands like GET/PING/EXISTS/TYPE/LLEN/etc. to the WAL would be
+     * pure waste: replaying a GET on startup would do nothing to
+     * DataStore's state, so there is nothing worth making durable there.
+     *
+     * A `Set.of(...)` here is IMMUTABLE — a well-known Java gotcha worth
+     * naming explicitly: calling .add(...) or .remove(...) on the Set this
+     * returns would throw UnsupportedOperationException at runtime, not a
+     * compile error. That's actually exactly what we want here: this list
+     * of write commands is fixed, shared, and must never be accidentally
+     * mutated by whatever code holds onto a reference to it.
+     */
+    private static final Set<String> WRITE_COMMANDS = Set.of(
+            "SET", "DEL", "LPUSH", "RPUSH", "LPOP", "RPOP", "HSET", "HDEL", "SADD", "SREM"
+    );
+
+    /**
+     * @return true if `commandName` mutates DataStore when it runs (and
+     *         therefore needs to be durably logged before being applied),
+     *         false for read-only commands (PING, GET, EXISTS, TYPE, LLEN,
+     *         LRANGE, HGET, HGETALL, SMEMBERS, SISMEMBER) or unrecognized
+     *         command names.
+     *
+     * `commandName.toUpperCase(Locale.ROOT)` mirrors process()'s own
+     * normalization — a caller can safely pass a command name in any
+     * casing ("set", "SET", "sEt") and get the correct answer, exactly
+     * like the actual command dispatch does.
+     */
+    public static boolean isWriteCommand(String commandName) {
+        return WRITE_COMMANDS.contains(commandName.toUpperCase(Locale.ROOT));
+    }
+
+    /**
      * Processes one command and returns the result to reply with.
      *
      * `List<String> args` is the whole command line as separate words,
