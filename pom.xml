@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  pom.xml = Maven ka "recipe card". Ye batata hai:
+    1. Project ki identity (kaun sa project hai, konsa version)
+    2. Java version kaunsi use karni hai
+    3. Kaunsi external libraries (dependencies) chahiye
+    4. Build kaise hoga (plugins) — jaise fat-JAR banana taaki
+       "java -jar app.jar" se seedha chal jaye.
+
+  Maven khud kuch "build" nahi karta jaise IntelliJ karta hai —
+  ye sirf ek engine hai jo is XML file ko padhkar steps follow karta hai:
+  dependencies download karo -> compile karo -> test karo -> package banao.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+                              http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <!--
+      modelVersion: Maven POM file format ka version hai — abhi ke liye
+      hamesha "4.0.0" hi hota hai. Isse Maven ko pata chalta hai ki
+      XML ko kis rule-set (schema) ke against parse karna hai.
+      Ye kabhi nahi badalta, chahe tumhara project version kuch bhi ho.
+    -->
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      groupId + artifactId + version = ek project ki "GAV coordinates".
+      Ye teeno milke is project ko duniya me uniquely identify karte hain
+      (jaise Maven Central pe har library ke ye 3 cheezein hoti hain).
+
+      groupId: usually reversed domain name (com.redis) — organization/namespace.
+      artifactId: project ka naam — jar/project ka actual name.
+      version: "1.0-SNAPSHOT" ka matlab hai ye "under development" version hai,
+                final/stable release nahi. SNAPSHOT builds baar-baar rebuild
+                hoti rehti hain jab tak tum "1.0" (release) pe move nahi karte.
+    -->
+    <groupId>com.redis</groupId>
+    <artifactId>redis-from-scratch</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <!--
+      packaging: batata hai final output kya banega.
+      "jar" = ek executable/library JAR file banegi (default value hi hai,
+      isliye likhna optional hai, lekin explicit rakhna clarity ke liye achha hai).
+    -->
+    <packaging>jar</packaging>
+
+    <name>Redis From Scratch</name>
+    <description>A distributed Redis clone built from scratch in Java for learning purposes</description>
+
+    <!--
+      properties block: yaha hum reusable "variables" define karte hain
+      jo niche multiple jagah use honge. Isse agar kal Java version badalni ho,
+      to sirf ek jagah change karna padega, har plugin me alag-alag nahi.
+    -->
+    <properties>
+        <!--
+          project.build.sourceEncoding: source files (.java) kaunse
+          character encoding me likhe hain, ye batata hai. UTF-8 hamesha
+          safe choice hai — isse Windows/Linux/Mac sab pe compile karte waqt
+          ஃ ya special characters ka garbage/mismatch nahi hota.
+        -->
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <!--
+          maven.compiler.release: Maven ko bolta hai "Java 21 syntax/API allow karo,
+          aur Java 21 bytecode generate karo". Java 21 isliye chuna hai kyunki
+          humein VIRTUAL THREADS chahiye (java.lang.Thread.ofVirtual()), jo
+          Java 21 me final/stable feature ban gaye the (isse pehle preview me the).
+
+          Virtual threads kya hote hain (chhota intro, detail Server.java me milega):
+          Normal ("platform") thread ek heavy OS-level resource hota hai — agar
+          1000 clients connect karein to 1000 heavy OS threads banane padte hain,
+          jo bahut memory aur context-switching overhead deta hai.
+          Virtual thread ek "lightweight" thread hota hai jise JVM khud manage
+          karta hai — hum lakhon virtual threads bana sakte hain bina system
+          crash kiye. Hamare Redis clone me har client connection ek virtual
+          thread pe handle hogi (Server.java / ClientHandler.java me).
+        -->
+        <maven.compiler.release>21</maven.compiler.release>
+
+        <!--
+          Dependency versions ko yaha properties me rakhna best practice hai —
+          isse dependencies section clean rehta hai aur version-bump ek hi
+          jagah se ho jata hai.
+        -->
+        <junit.version>5.10.2</junit.version>
+        <slf4j.version>2.0.13</slf4j.version>
+        <logback.version>1.5.6</logback.version>
+    </properties>
+
+    <!--
+      dependencies: ye external libraries hain jo humara code use karega.
+      Maven inhe automatically Maven Central (public repository) se download
+      karke ~/.m2/repository me cache kar dega — pehli baar internet chahiye,
+      uske baad offline bhi build ho sakta hai.
+
+      IMPORTANT DECISION: Is project me hum jaanbujhke bahut kam external
+      dependencies rakh rahe hain. Redis clone khud banane ka poora point hi
+      ye hai ki sockets, RESP protocol, hashing, consensus — sab KHUD likhein,
+      kisi library (jaise Netty ya existing Raft library) ka sahara na lein.
+      Isliye sirf "supporting" dependencies hain: logging aur testing.
+      Core logic (network, persistence, raft, cluster) 100% hamara apna
+      Java code hoga, koi external framework nahi.
+    -->
+    <dependencies>
+        <!--
+          ===== LOGGING: SLF4J + Logback =====
+          Humein System.out.println() ki jagah proper logging chahiye kyunki:
+          1. Distributed system me multiple nodes chal rahe honge — logs me
+             timestamp, thread name, log-level (INFO/WARN/ERROR) hona zaroori
+             hai taaki debug karte waqt pata chale kaunsa node, kaunsa thread,
+             kab kya kar raha tha.
+          2. Raft leader election, replication lag, WAL writes jaise events
+             ko structured tareeke se track karna hoga.
+
+          SLF4J (Simple Logging Facade for Java) ek "facade/interface" hai —
+          matlab ye khud logging nahi karta, balki ek common API deta hai
+          (logger.info(...), logger.warn(...)) jiske peeche koi bhi actual
+          logging engine plug ho sakta hai.
+        -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <!--
+          Logback: SLF4J ke facade ka actual "implementation" (engine).
+          Ye wo library hai jo asal me console/file pe log likhti hai,
+          log rotation karti hai, format decide karti hai, etc.
+          Scope "runtime" isliye hai kyunki compile-time pe hamara code
+          sirf slf4j-api ke against compile hota hai (loose coupling ke liye);
+          logback sirf jab app chalti hai (runtime) tab zaroori hai.
+        -->
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+          ===== TESTING: JUnit 5 (Jupiter) =====
+          Distributed system me bugs bahut subtle hote hain (race conditions,
+          off-by-one in consistent hashing, WAL replay order, etc.) — isliye
+          har phase ke baad hum unit tests likhenge (jaise DataStore ka
+          correctness test, ConsistentHashRing ka distribution test).
+
+          Scope "test" ka matlab hai: ye dependency sirf test-compile aur
+          test-run ke waqt classpath me hoga. Jab tum final JAR banaoge ya
+          "java -jar" se app run karoge, JUnit us JAR ke andar bilkul
+          nahi hoga — production code halka rahega.
+        -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <!--
+      NOTE: RESP protocol parsing, HTTP dashboard (com.sun.net.httpserver),
+      NIO sockets/ByteBuffer, ReentrantReadWriteLock, ExecutorService/virtual
+      threads — ye SAB Java ki standard library (JDK) ka hi hissa hain.
+      Inke liye HUME KOI extra dependency add karne ki zaroorat nahi hai —
+      isliye tumhe upar sirf 3 dependencies dikhengi (slf4j, logback, junit).
+      Ye jaanbujhkar kiya gaya minimal setup hai.
+    -->
+
+    <build>
+        <!--
+          finalName: normally Maven jo JAR banata hai uska naam
+          "artifactId-version.jar" hota hai (jaise redis-from-scratch-1.0-SNAPSHOT.jar).
+          finalName set karke hum us naam ko fix/short kar rahe hain taaki
+          run karte waqt command chhota aur predictable rahe:
+          "java -jar target/redis-server.jar"
+        -->
+        <finalName>redis-server</finalName>
+
+        <plugins>
+            <!--
+              ===== maven-compiler-plugin =====
+              Ye plugin batata hai Maven ko ki .java files ko .class me
+              compile kaise karna hai. Hum yaha explicitly release=21 pass
+              kar rahe hain (properties wale maven.compiler.release ko
+              plugin khud pick kar leta hai, ye <configuration> redundant
+              safety ke liye hai — kai IDE/Maven versions me explicit likhna
+              zyada reliable hota hai).
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>21</release>
+                </configuration>
+            </plugin>
+
+            <!--
+              ===== maven-surefire-plugin =====
+              Ye plugin "mvn test" command ke waqt actual me JUnit tests ko
+              chalata hai aur result report karta hai (kitne pass/fail hue).
+              Without this (purani Maven versions me) JUnit 5 tests kabhi
+              discover hi nahi hote — isliye explicit version pin karna
+              zaroori hai taaki JUnit 5 (Jupiter) properly detect ho.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+
+            <!--
+              ===== maven-shade-plugin =====
+              Humara project multiple dependencies use karta hai (slf4j,
+              logback). Agar hum simple "mvn package" karke normal JAR
+              banayein, to us JAR ke andar sirf HAMARA code hoga —
+              dependencies alag se classpath me deni padengi, jo
+              "java -jar redis-server.jar" se seedha chalane par FAIL karega
+              (ClassNotFoundException aayega jab logging code chalega).
+
+              Shade plugin ek "fat JAR" / "uber JAR" banata hai — matlab
+              saari dependencies ko HAMARE JAR ke andar hi bundle kar deta
+              hai. Isse ek single JAR file bas double-click/run karne se
+              sab kuch chal jata hai, chahe wo Node 1, Node 2 ya Node 3 pe
+              deploy kar rahe ho — koi extra classpath setup nahi chahiye.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <!--
+                      execution: ek plugin ke andar "kab chalna hai" aur
+                      "kya karna hai" define karta hai.
+                      phase "package" = jab Maven "mvn package" step pe
+                      pahunchta hai (matlab compile+test ho chuke, ab final
+                      artifact banana hai), tab ye shade goal chalega.
+                    -->
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <transformers>
+                                <!--
+                                  ManifestResourceTransformer: JAR ke andar
+                                  MANIFEST.MF file me "Main-Class" entry add
+                                  karta hai. Isi wajah se hum sirf
+                                  "java -jar redis-server.jar" likh sakte hain —
+                                  JVM ko pata chal jata hai ki program kaha se
+                                  shuru karna hai (com.redis.Main), humein
+                                  "-cp ... com.redis.Main" jaisa lamba command
+                                  nahi likhna padta.
+                                -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <mainClass>com.redis.Main</mainClass>
+                                </transformer>
+                            </transformers>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
