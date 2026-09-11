@@ -24,30 +24,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * is why we made junit-jupiter's scope "test" in pom.xml.
  *
  * @Test — an ANNOTATION (the @ symbol). An annotation is metadata attached
- *       to a method/class/field that some other tool reads and acts on — it
- *       adds
- *       no behavior by itself. Here, @Test tells JUnit's test runner (invoked
- *       by
- *       the surefire plugin during `mvn test`) "this method is a test case, run
- *       it and report whether it passes or fails." Without @Test, a method in
- *       this file is just a regular unused method — JUnit would never call it.
+ * to a method/class/field that some other tool reads and acts on — it adds
+ * no behavior by itself. Here, @Test tells JUnit's test runner (invoked by
+ * the surefire plugin during `mvn test`) "this method is a test case, run
+ * it and report whether it passes or fails." Without @Test, a method in
+ * this file is just a regular unused method — JUnit would never call it.
  *
- *       assertEquals(expected, actual) — the core JUnit building block. It
- *       compares two values; if they don't match, the test FAILS immediately
- *       with a message showing exactly what was expected vs what was actually
- *       received, and JUnit moves on to the next test method (one failing
- *       assertion does not stop other test methods from running).
+ * assertEquals(expected, actual) — the core JUnit building block. It
+ * compares two values; if they don't match, the test FAILS immediately
+ * with a message showing exactly what was expected vs what was actually
+ * received, and JUnit moves on to the next test method (one failing
+ * assertion does not stop other test methods from running).
  *
  * @BeforeEach — another annotation. JUnit creates a BRAND NEW instance of
- *             this whole test class for EVERY single @Test method (this is
- *             intentional
- *             test isolation — it stops one test's leftover state from silently
- *             affecting another test that happens to run after it). A method
- *             marked
+ * this whole test class for EVERY single @Test method (this is intentional
+ * test isolation — it stops one test's leftover state from silently
+ * affecting another test that happens to run after it). A method marked
  * @BeforeEach runs automatically right before each and every @Test method,
- *             on that fresh instance — perfect for "set up a clean DataStore
- *             and
- *             CommandProcessor so every test starts from an empty database."
+ * on that fresh instance — perfect for "set up a clean DataStore and
+ * CommandProcessor so every test starts from an empty database."
  */
 class CommandProcessorTest {
 
@@ -135,8 +130,7 @@ class CommandProcessorTest {
     void rpushAddsToTailInGivenOrder() {
         run("RPUSH", "mylist", "a", "b", "c");
         List<CommandProcessor.CommandResult> items = run("LRANGE", "mylist", "0", "-1").getArrayPayload();
-        assertEquals(List.of("a", "b", "c"),
-                items.stream().map(CommandProcessor.CommandResult::getStringPayload).toList());
+        assertEquals(List.of("a", "b", "c"), items.stream().map(CommandProcessor.CommandResult::getStringPayload).toList());
     }
 
     @Test
@@ -173,8 +167,7 @@ class CommandProcessorTest {
     @Test
     void saddSremAndSismemberTrackMembershipCorrectly() {
         CommandProcessor.CommandResult addResult = run("SADD", "tags", "java", "redis", "java");
-        // "java" appears twice in the same SADD call -> only counted once as newly
-        // added.
+        // "java" appears twice in the same SADD call -> only counted once as newly added.
         assertEquals(2, addResult.getIntegerPayload());
 
         assertEquals(1, run("SISMEMBER", "tags", "redis").getIntegerPayload());
@@ -189,5 +182,97 @@ class CommandProcessorTest {
         CommandProcessor.CommandResult result = run("FOOBAR", "x");
         assertEquals(CommandProcessor.CommandResult.Type.ERROR, result.getType());
         assertTrue(result.getStringPayload().contains("unknown command"));
+    }
+
+    // ===== Phase 4: EXPIRE / PEXPIRE / TTL / PTTL / PERSIST / SET EX|PX =====
+    // These tests only check the BOOKKEEPING logic in CommandProcessor
+    // (does TTL report roughly the right number? does EXPIRE set something
+    // that TTL can then see? does PERSIST clear it?) — they do NOT test
+    // that a key actually gets DELETED once time passes. That's a
+    // different concern, already covered separately: DataStore.get()'s
+    // lazy-expiry path, and ExpiryManager's active sweep (see
+    // ExpiryManagerTest.java), are what actually remove expired keys.
+
+    @Test
+    void expireOnExistingKeySucceedsAndTtlReflectsIt() {
+        run("SET", "foo", "bar");
+
+        // EXPIRE returns 1 when the key existed and the expiry was set.
+        assertEquals(1, run("EXPIRE", "foo", "100").getIntegerPayload());
+
+        // TTL is in SECONDS and reports "time remaining", so right after
+        // setting a 100-second expiry it should be close to 100 — we allow
+        // a little slack rather than asserting an exact value, since a
+        // small amount of real time always passes between the EXPIRE call
+        // above and the TTL call below.
+        long ttlSeconds = run("TTL", "foo").getIntegerPayload();
+        assertTrue(ttlSeconds > 90 && ttlSeconds <= 100,
+                "expected TTL close to 100 seconds, got " + ttlSeconds);
+    }
+
+    @Test
+    void expireOnMissingKeyReturnsZero() {
+        // "neverSet" was never SET, so EXPIRE has nothing to attach a TTL
+        // to and must report 0 (no-op), matching real Redis's semantics.
+        assertEquals(0, run("EXPIRE", "neverSet", "100").getIntegerPayload());
+    }
+
+    @Test
+    void pexpireAndPttlUseMilliseconds() {
+        run("SET", "foo", "bar");
+        assertEquals(1, run("PEXPIRE", "foo", "5000").getIntegerPayload());
+
+        long remainingMillis = run("PTTL", "foo").getIntegerPayload();
+        // Should be close to 5000ms, minus whatever tiny amount of real
+        // time has elapsed since the PEXPIRE call above.
+        assertTrue(remainingMillis > 4000 && remainingMillis <= 5000,
+                "expected PTTL close to 5000ms, got " + remainingMillis);
+    }
+
+    @Test
+    void ttlReturnsMinusTwoForMissingKeyAndMinusOneForKeyWithNoExpiry() {
+        // -2: the key doesn't exist at all.
+        assertEquals(-2, run("TTL", "doesNotExist").getIntegerPayload());
+
+        // -1: the key exists, but has no expiry set on it.
+        run("SET", "permanent", "value");
+        assertEquals(-1, run("TTL", "permanent").getIntegerPayload());
+    }
+
+    @Test
+    void persistRemovesExpiryAndTtlGoesBackToMinusOne() {
+        run("SET", "foo", "bar");
+        run("EXPIRE", "foo", "100");
+
+        // PERSIST returns 1 when it actually removed an existing expiry.
+        assertEquals(1, run("PERSIST", "foo").getIntegerPayload());
+        assertEquals(-1, run("TTL", "foo").getIntegerPayload());
+
+        // Calling PERSIST again now that there's no expiry left to remove
+        // must report 0 (nothing to do), not 1 again.
+        assertEquals(0, run("PERSIST", "foo").getIntegerPayload());
+    }
+
+    @Test
+    void setWithExOptionAppliesExpiryInSeconds() {
+        run("SET", "foo", "bar", "EX", "100");
+        long ttlSeconds = run("TTL", "foo").getIntegerPayload();
+        assertTrue(ttlSeconds > 90 && ttlSeconds <= 100,
+                "expected TTL close to 100 seconds, got " + ttlSeconds);
+    }
+
+    @Test
+    void setWithPxOptionAppliesExpiryInMilliseconds() {
+        run("SET", "foo", "bar", "PX", "5000");
+        long remainingMillis = run("PTTL", "foo").getIntegerPayload();
+        assertTrue(remainingMillis > 4000 && remainingMillis <= 5000,
+                "expected PTTL close to 5000ms, got " + remainingMillis);
+    }
+
+    @Test
+    void setWithUnknownOptionReturnsSyntaxError() {
+        CommandProcessor.CommandResult result = run("SET", "foo", "bar", "XX", "100");
+        assertEquals(CommandProcessor.CommandResult.Type.ERROR, result.getType());
+        assertTrue(result.getStringPayload().contains("syntax error"));
     }
 }

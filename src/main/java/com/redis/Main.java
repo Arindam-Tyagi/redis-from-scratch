@@ -5,6 +5,7 @@ import com.redis.core.DataStore;
 import com.redis.network.Server;
 import com.redis.persistence.SnapshotManager;
 import com.redis.persistence.WriteAheadLog;
+import com.redis.ttl.ExpiryManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -88,6 +89,16 @@ public class Main {
         logger.info("Replayed {} WAL command(s); DataStore now has {} key(s)",
                 walCommands.size(), dataStore.size());
 
+        // ===== Phase 4: start active expiry =====
+        // Everything above this point is recovery — restoring exactly the
+        // state the server had before it last stopped. Active expiry is
+        // ongoing, ordinary server operation, so it starts fresh here, AFTER
+        // recovery is done, exactly like the client-accepting Server below
+        // it. Starting it any earlier (e.g. during WAL replay) would risk it
+        // sweeping through a DataStore that isn't fully reconstructed yet.
+        ExpiryManager expiryManager = new ExpiryManager(dataStore);
+        expiryManager.start();
+
         // ===== Shutdown hook — a new JVM concept =====
         // Runtime.getRuntime().addShutdownHook(thread) registers a Thread
         // that the JVM will automatically start and wait for whenever the
@@ -102,7 +113,8 @@ public class Main {
         // shutdown case: it lets us close the WAL's file handle properly
         // rather than relying on the OS to clean it up eventually.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            logger.info("Shutting down — closing WAL file handle...");
+            logger.info("Shutting down — stopping active expiry and closing WAL file handle...");
+            expiryManager.stop();
             try {
                 wal.close();
             } catch (IOException e) {
