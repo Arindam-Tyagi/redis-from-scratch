@@ -6,6 +6,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -50,7 +51,8 @@ public class CommandProcessor {
      * mutated by whatever code holds onto a reference to it.
      */
     private static final Set<String> WRITE_COMMANDS = Set.of(
-            "SET", "DEL", "LPUSH", "RPUSH", "LPOP", "RPOP", "HSET", "HDEL", "SADD", "SREM"
+            "SET", "DEL", "LPUSH", "RPUSH", "LPOP", "RPOP", "HSET", "HDEL", "SADD", "SREM",
+            "EXPIRE", "PEXPIRE", "PERSIST"
     );
 
     /**
@@ -123,6 +125,11 @@ public class CommandProcessor {
                 case "SREM" -> srem(arguments);
                 case "SMEMBERS" -> smembers(arguments);
                 case "SISMEMBER" -> sismember(arguments);
+                case "EXPIRE" -> expire(arguments, false);
+                case "PEXPIRE" -> expire(arguments, true);
+                case "TTL" -> ttl(arguments, false);
+                case "PTTL" -> ttl(arguments, true);
+                case "PERSIST" -> persist(arguments);
                 default -> CommandResult.error("ERR unknown command '" + commandName + "'");
             };
         } catch (RedisValue.WrongTypeException e) {
@@ -165,13 +172,40 @@ public class CommandProcessor {
     // DataStore.set()'s single atomic store.put(key, value) under the
     // write lock already protects.
 
+    /**
+     * SET key value               -> plain set, no expiry
+     * SET key value EX seconds    -> set with a TTL given in whole seconds
+     * SET key value PX millis     -> set with a TTL given in milliseconds
+     *
+     * We build the RedisValue FIRST (with its expiry already attached, if
+     * any) and only THEN hand it to dataStore.set(...) — this way the key
+     * becomes visible to any other thread already carrying its correct
+     * expiry from the very first instant it exists, rather than briefly
+     * existing without one and having the expiry attached a moment later
+     * (which would create a tiny window where a concurrent TTL/GET could
+     * observe an inconsistent state).
+     */
     private CommandResult set(List<String> args) {
-        if (args.size() != 2) {
+        if (args.size() != 2 && args.size() != 4) {
             return wrongArgs("set");
         }
         String key = args.get(0);
         String value = args.get(1);
-        dataStore.set(key, RedisValue.ofString(value));
+        RedisValue redisValue = RedisValue.ofString(value);
+
+        if (args.size() == 4) {
+            String option = args.get(2).toUpperCase(Locale.ROOT);
+            long amount = Long.parseLong(args.get(3)); // NumberFormatException -> caught centrally in process()
+            switch (option) {
+                case "EX" -> redisValue.setExpireInMillis(amount * 1000L);
+                case "PX" -> redisValue.setExpireInMillis(amount);
+                default -> {
+                    return CommandResult.error("ERR syntax error");
+                }
+            }
+        }
+
+        dataStore.set(key, redisValue);
         return CommandResult.simpleString("OK");
     }
 
@@ -221,6 +255,106 @@ public class CommandProcessor {
         return dataStore.get(args.get(0))
                 .map(value -> CommandResult.simpleString(value.getType().name().toLowerCase(Locale.ROOT)))
                 .orElse(CommandResult.simpleString("none"));
+    }
+
+    // ==================== TTL commands ====================
+    // Unlike the LIST/HASH/SET commands below, these do NOT need
+    // dataStore.readTransaction/writeTransaction. They only ever touch
+    // RedisValue's own `expireAt` field via setExpireInMillis()/
+    // removeExpiry()/getExpireAt() — and that field is `volatile` (see
+    // RedisValue.java's detailed explanation of why). A single volatile
+    // write or read is already safe across threads on its own; the
+    // writeTransaction machinery exists specifically to protect MULTI-STEP
+    // sequences against a MUTABLE COLLECTION (a List/Map/Set) inside a
+    // RedisValue, which isn't what's happening here at all.
+
+    /**
+     * EXPIRE key seconds  (isMillis = false)
+     * PEXPIRE key millis  (isMillis = true)
+     *
+     * Returns 1 if the key exists and its expiry was set, 0 if the key
+     * doesn't exist (nothing to attach an expiry to) — matching real
+     * Redis's EXPIRE/PEXPIRE return values exactly.
+     */
+    private CommandResult expire(List<String> args, boolean isMillis) {
+        if (args.size() != 2) {
+            return wrongArgs(isMillis ? "pexpire" : "expire");
+        }
+        String key = args.get(0);
+        long amount = Long.parseLong(args.get(1));
+        long millis = isMillis ? amount : amount * 1000L;
+
+        Optional<RedisValue> value = dataStore.get(key);
+        if (value.isEmpty()) {
+            return CommandResult.integer(0);
+        }
+        value.get().setExpireInMillis(millis);
+        return CommandResult.integer(1);
+    }
+
+    /**
+     * TTL key   (isMillis = false) -> remaining seconds
+     * PTTL key  (isMillis = true)  -> remaining milliseconds
+     *
+     * Return value follows real Redis's exact three-way convention:
+     *   -2  the key does not exist at all
+     *   -1  the key exists but has NO expiry set (lives forever)
+     *   >=0 the key exists and this many seconds/milliseconds remain
+     * Replicating these exact sentinel values (rather than inventing our
+     * own) means any real Redis client library's TTL-handling code would
+     * work correctly against our server without modification.
+     */
+    private CommandResult ttl(List<String> args, boolean isMillis) {
+        if (args.size() != 1) {
+            return wrongArgs(isMillis ? "pttl" : "ttl");
+        }
+        Optional<RedisValue> value = dataStore.get(args.get(0));
+        if (value.isEmpty()) {
+            return CommandResult.integer(-2);
+        }
+        RedisValue redisValue = value.get();
+        if (!redisValue.hasExpiry()) {
+            return CommandResult.integer(-1);
+        }
+
+        long remainingMillis = redisValue.getExpireAt() - System.currentTimeMillis();
+        if (remainingMillis < 0) {
+            // Extremely unlikely in practice (dataStore.get() above would
+            // normally have already lazily removed a truly expired key
+            // before we ever got this far), but clamping to 0 rather than
+            // returning a confusing negative "remaining time" is the safe,
+            // defensive choice.
+            remainingMillis = 0;
+        }
+
+        if (isMillis) {
+            return CommandResult.integer(remainingMillis);
+        }
+        // Ceiling division (not simple truncation) when converting to
+        // whole seconds: real Redis's TTL rounds UP, so a key with 1500ms
+        // left is reported as "2" seconds remaining, not "1" — reporting
+        // less time than truly remains could mislead a client into
+        // treating a key as more urgent to refresh than it actually is.
+        long remainingSeconds = (remainingMillis + 999) / 1000;
+        return CommandResult.integer(remainingSeconds);
+    }
+
+    /**
+     * Removes a key's expiry entirely, making it live forever again.
+     * Returns 1 if the key existed AND had an expiry that was just
+     * removed, 0 if the key doesn't exist or already had no expiry —
+     * matching real Redis's PERSIST return value.
+     */
+    private CommandResult persist(List<String> args) {
+        if (args.size() != 1) {
+            return wrongArgs("persist");
+        }
+        Optional<RedisValue> value = dataStore.get(args.get(0));
+        if (value.isEmpty() || !value.get().hasExpiry()) {
+            return CommandResult.integer(0);
+        }
+        value.get().removeExpiry();
+        return CommandResult.integer(1);
     }
 
     // ==================== LIST commands ====================
