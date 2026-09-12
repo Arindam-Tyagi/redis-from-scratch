@@ -2,7 +2,9 @@ package com.redis.network;
 
 import com.redis.core.CommandProcessor;
 import com.redis.core.CommandProcessor.CommandResult;
+import com.redis.core.DataStore;
 import com.redis.persistence.WriteAheadLog;
+import com.redis.replication.ReplicationManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,10 +64,24 @@ public class ClientHandler implements Runnable {
     private final CommandProcessor commandProcessor;
     private final WriteAheadLog wal;
 
-    public ClientHandler(Socket clientSocket, CommandProcessor commandProcessor, WriteAheadLog wal) {
+    // ===== Phase 6 additions =====
+    // dataStore: needed to build a full-sync dump when a replica connects
+    // and sends SYNC (see handleSync() below).
+    // replicationManager: null on a REPLICA node's own Server (replicas
+    // don't accept connections from further sub-replicas in this
+    // project), non-null on a PRIMARY node's Server. Exactly the same
+    // "null means this feature is off" pattern CommandProcessor already
+    // uses for its own ClusterConfig field.
+    private final DataStore dataStore;
+    private final ReplicationManager replicationManager;
+
+    public ClientHandler(Socket clientSocket, CommandProcessor commandProcessor, WriteAheadLog wal,
+                          DataStore dataStore, ReplicationManager replicationManager) {
         this.clientSocket = clientSocket;
         this.commandProcessor = commandProcessor;
         this.wal = wal;
+        this.dataStore = dataStore;
+        this.replicationManager = replicationManager;
     }
 
     /**
@@ -121,8 +137,45 @@ public class ClientHandler implements Runnable {
                     continue;
                 }
 
+                // ===== Phase 6: a replica introducing itself =====
+                // SYNC is special: it's not a normal CommandProcessor
+                // command at all (it never touches DataStore), and it gets
+                // NO normal reply — handleSync() writes the full dataset
+                // dump directly, then registers this connection to keep
+                // receiving future writes. We deliberately check this
+                // BEFORE calling handleOneCommand()/writeReply() below, so
+                // SYNC never falls through to CommandProcessor (which
+                // would otherwise treat it as an unknown command and
+                // reply with an error).
+                if (replicationManager != null && args.get(0).equalsIgnoreCase("SYNC")) {
+                    handleSync(out);
+                    // Loop straight back to parser.parseCommand(). A
+                    // replica never sends anything else after SYNC, so
+                    // that call will simply block, parking this thread
+                    // harmlessly, for as long as this replica stays
+                    // connected — exactly what we want: the socket (and
+                    // its OutputStream, now registered with
+                    // replicationManager) stays open and ready to receive
+                    // future propagated writes, without this thread
+                    // spinning or doing anything else in the meantime.
+                    continue;
+                }
+
                 CommandResult result = handleOneCommand(args);
                 RESPParser.writeReply(out, result);
+
+                // ===== Phase 6: propagate successful writes to replicas =====
+                // Runs AFTER the reply is sent to the real client, and
+                // only for commands that (a) are write commands and (b)
+                // actually succeeded (didn't come back as an ERROR, e.g.
+                // from a WRONGTYPE or wrong-argument-count problem) — a
+                // failed write never mutated DataStore, so there is
+                // nothing for a replica to apply either.
+                if (replicationManager != null
+                        && CommandProcessor.isWriteCommand(args.get(0))
+                        && result.getType() != CommandResult.Type.ERROR) {
+                    replicationManager.propagate(args);
+                }
             }
         } catch (IOException e) {
             // A real network problem — the client's connection dropped
@@ -190,5 +243,21 @@ public class ClientHandler implements Runnable {
         }
 
         return commandProcessor.process(args);
+    }
+
+    /**
+     * Handles an incoming SYNC command from a connecting replica: delegates
+     * the actual work to ReplicationManager (which owns every piece of
+     * replication-specific logic — see ReplicationManager.performFullSync),
+     * passing it this connection's OutputStream and this node's DataStore.
+     * If writing the full sync fails partway through (the replica
+     * disconnected before we finished, say), we let the IOException
+     * propagate up to run()'s own catch block, which already knows how to
+     * log a dropped connection and clean up — no special handling needed
+     * here beyond that.
+     */
+    private void handleSync(OutputStream out) throws IOException {
+        logger.info("Replica connected from {} - sending full sync", clientSocket.getRemoteSocketAddress());
+        replicationManager.performFullSync(out, dataStore);
     }
 }

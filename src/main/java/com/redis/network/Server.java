@@ -1,7 +1,9 @@
 package com.redis.network;
 
 import com.redis.core.CommandProcessor;
+import com.redis.core.DataStore;
 import com.redis.persistence.WriteAheadLog;
+import com.redis.replication.ReplicationManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -78,10 +80,19 @@ public class Server {
     private final CommandProcessor commandProcessor;
     private final WriteAheadLog wal;
 
-    public Server(int port, CommandProcessor commandProcessor, WriteAheadLog wal) {
+    // ===== Phase 6 additions ===== (just passed straight through to every
+    // ClientHandler this Server creates — see ClientHandler.java for what
+    // each one is actually used for)
+    private final DataStore dataStore;
+    private final ReplicationManager replicationManager;
+
+    public Server(int port, CommandProcessor commandProcessor, WriteAheadLog wal,
+                   DataStore dataStore, ReplicationManager replicationManager) {
         this.port = port;
         this.commandProcessor = commandProcessor;
         this.wal = wal;
+        this.dataStore = dataStore;
+        this.replicationManager = replicationManager;
     }
 
     /**
@@ -108,7 +119,7 @@ public class Server {
                 Socket clientSocket = serverSocket.accept();
                 logger.info("Accepted connection from {}", clientSocket.getRemoteSocketAddress());
 
-                ClientHandler handler = new ClientHandler(clientSocket, commandProcessor, wal);
+                ClientHandler handler = new ClientHandler(clientSocket, commandProcessor, wal, dataStore, replicationManager);
 
                 // Thread.ofVirtual() returns a BUILDER (a small object
                 // whose only purpose is to configure and then create
