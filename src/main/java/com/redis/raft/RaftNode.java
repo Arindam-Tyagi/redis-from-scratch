@@ -163,6 +163,14 @@ public class RaftNode {
 
     // ==================== Simple state accessors ====================
 
+    // Phase 8 addition: the dashboard needs to label each node by its own
+    // id when displaying status - selfId itself never changes after
+    // construction, so this needs no synchronization at all (unlike the
+    // fields below it, which mutate as the node's role/term change).
+    public String getSelfId() {
+        return selfId;
+    }
+
     public synchronized Role getRole() {
         return role;
     }
