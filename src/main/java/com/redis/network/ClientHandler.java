@@ -4,6 +4,7 @@ import com.redis.core.CommandProcessor;
 import com.redis.core.CommandProcessor.CommandResult;
 import com.redis.core.DataStore;
 import com.redis.persistence.WriteAheadLog;
+import com.redis.raft.RaftNode;
 import com.redis.replication.ReplicationManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,13 +76,25 @@ public class ClientHandler implements Runnable {
     private final DataStore dataStore;
     private final ReplicationManager replicationManager;
 
+    // ===== Phase 7 addition =====
+    // Non-null exactly when this node participates in a Raft group. When
+    // present, it takes over WRITE commands entirely (see
+    // handleOneCommand below) - a write no longer goes straight to
+    // CommandProcessor/WAL the Phase 1-6 way; it goes through Raft
+    // consensus first, and only gets applied (and logged to the WAL) once
+    // a majority agrees, from inside RaftNode.applyCommittedEntries. Read
+    // commands are completely unaffected either way - they just read
+    // this node's own local DataStore directly, same as always.
+    private final RaftNode raftNode;
+
     public ClientHandler(Socket clientSocket, CommandProcessor commandProcessor, WriteAheadLog wal,
-                          DataStore dataStore, ReplicationManager replicationManager) {
+                          DataStore dataStore, ReplicationManager replicationManager, RaftNode raftNode) {
         this.clientSocket = clientSocket;
         this.commandProcessor = commandProcessor;
         this.wal = wal;
         this.dataStore = dataStore;
         this.replicationManager = replicationManager;
+        this.raftNode = raftNode;
     }
 
     /**
@@ -226,6 +239,19 @@ public class ClientHandler implements Runnable {
     private CommandResult handleOneCommand(List<String> args) {
         String commandName = args.get(0);
 
+        // ===== Phase 7: writes on a Raft-managed node go through consensus =====
+        // raftNode is only non-null for a node running Raft (every one of
+        // our 9 Phase 7 nodes). For those, a write command bypasses the
+        // Phase 1-6 "WAL then apply directly" path entirely - see
+        // handleRaftWrite's own comment for the full reasoning. Reads
+        // (GET, LRANGE, etc.) and PING fall straight through to the
+        // ordinary path below unchanged, since they never need
+        // consensus - they just answer from this node's own local,
+        // already-consistent DataStore.
+        if (raftNode != null && CommandProcessor.isWriteCommand(commandName)) {
+            return handleRaftWrite(args);
+        }
+
         if (CommandProcessor.isWriteCommand(commandName)) {
             try {
                 wal.append(args);
@@ -243,6 +269,77 @@ public class ClientHandler implements Runnable {
         }
 
         return commandProcessor.process(args);
+    }
+
+    // How long (in milliseconds) we're willing to sit here waiting for a
+    // proposed write to actually get committed and applied before giving
+    // up and telling the client something went wrong, rather than
+    // blocking this connection's thread forever. Comfortably longer than
+    // a normal commit should ever take (a handful of heartbeat intervals,
+    // ~100ms each) even accounting for an election happening mid-write.
+    private static final long RAFT_WRITE_TIMEOUT_MILLIS = 2000;
+    private static final long RAFT_WRITE_POLL_INTERVAL_MILLIS = 5;
+
+    /**
+     * Routes ONE write command through Raft consensus instead of applying
+     * it directly, and waits for the result.
+     *
+     * ===== Why this blocks the calling thread, and why that's fine here =====
+     * A real client sending SET expects a reply that reflects reality -
+     * "OK" should mean the write is actually safe (replicated to a
+     * majority), not just "a leader wrote it to ITS OWN memory and might
+     * lose it if it crashes a millisecond later." So we can't reply the
+     * instant proposeCommand() returns; we have to wait until this
+     * specific index is committed AND applied. This method blocks the
+     * CURRENT thread doing exactly that (a simple sleep-and-poll loop -
+     * simpler to reason about than wiring up callbacks/futures for a
+     * project at this scope, and perfectly fine here specifically BECAUSE
+     * this is a virtual thread (Server.java) - blocking it costs nothing
+     * beyond this one client's own reply latency, and every OTHER
+     * client's virtual thread keeps running completely unaffected in the
+     * meantime.
+     */
+    private CommandResult handleRaftWrite(List<String> args) {
+        if (!raftNode.isLeader()) {
+            String leaderHint = raftNode.getLeaderId();
+            return CommandResult.error("TRYAGAIN not the leader for this shard"
+                    + (leaderHint != null ? " - current leader is '" + leaderHint + "'" : " - leader unknown right now"));
+        }
+
+        int index = raftNode.proposeCommand(args);
+        if (index == -1) {
+            // Lost leadership in the tiny window between the isLeader()
+            // check above and this call (e.g. a higher-term AppendEntries
+            // arrived from a legitimate new leader) - tell the client to
+            // simply retry, exactly like the branch above.
+            return CommandResult.error("TRYAGAIN not the leader for this shard - please retry");
+        }
+
+        long deadline = System.currentTimeMillis() + RAFT_WRITE_TIMEOUT_MILLIS;
+        while (System.currentTimeMillis() < deadline) {
+            CommandResult result = raftNode.getAppliedResult(index);
+            if (result != null) {
+                return result;
+            }
+            try {
+                Thread.sleep(RAFT_WRITE_POLL_INTERVAL_MILLIS);
+            } catch (InterruptedException e) {
+                // Restore the interrupt flag rather than swallowing it
+                // silently — the standard, correct way to handle
+                // InterruptedException when we're not actually going to
+                // rethrow it (see ReplicaClient's sleepBeforeRetry in
+                // Phase 6 for the same pattern, explained more fully).
+                Thread.currentThread().interrupt();
+                return CommandResult.error("ERR interrupted while waiting for write to commit");
+            }
+        }
+
+        // Timed out - this can genuinely happen (e.g. an election was in
+        // progress, or too many peers are unreachable to form a
+        // majority). The command MAY still commit later; we simply
+        // couldn't confirm that in time to answer this client, so we're
+        // honest about the uncertainty rather than guessing OK or ERROR.
+        return CommandResult.error("ERR timed out waiting for write to commit - it may or may not have succeeded");
     }
 
     /**

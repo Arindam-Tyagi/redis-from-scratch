@@ -3,6 +3,7 @@ package com.redis.network;
 import com.redis.core.CommandProcessor;
 import com.redis.core.DataStore;
 import com.redis.persistence.WriteAheadLog;
+import com.redis.raft.RaftNode;
 import com.redis.replication.ReplicationManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -86,13 +87,22 @@ public class Server {
     private final DataStore dataStore;
     private final ReplicationManager replicationManager;
 
+    // ===== Phase 7 addition =====
+    // Null on a node not running Raft at all (kept only for backward
+    // compatibility with any earlier, pre-Phase-7 setup); non-null on
+    // every one of our 9 Phase 7 nodes. Passed straight through to every
+    // ClientHandler this Server creates - see ClientHandler.java for
+    // exactly how it changes write-command handling.
+    private final RaftNode raftNode;
+
     public Server(int port, CommandProcessor commandProcessor, WriteAheadLog wal,
-                   DataStore dataStore, ReplicationManager replicationManager) {
+                   DataStore dataStore, ReplicationManager replicationManager, RaftNode raftNode) {
         this.port = port;
         this.commandProcessor = commandProcessor;
         this.wal = wal;
         this.dataStore = dataStore;
         this.replicationManager = replicationManager;
+        this.raftNode = raftNode;
     }
 
     /**
@@ -119,7 +129,7 @@ public class Server {
                 Socket clientSocket = serverSocket.accept();
                 logger.info("Accepted connection from {}", clientSocket.getRemoteSocketAddress());
 
-                ClientHandler handler = new ClientHandler(clientSocket, commandProcessor, wal, dataStore, replicationManager);
+                ClientHandler handler = new ClientHandler(clientSocket, commandProcessor, wal, dataStore, replicationManager, raftNode);
 
                 // Thread.ofVirtual() returns a BUILDER (a small object
                 // whose only purpose is to configure and then create

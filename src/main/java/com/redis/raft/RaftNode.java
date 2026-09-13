@@ -1,6 +1,7 @@
 package com.redis.raft;
 
 import com.redis.core.CommandProcessor;
+import com.redis.persistence.WriteAheadLog;
 import com.redis.raft.RaftMessages.AppendEntriesRequest;
 import com.redis.raft.RaftMessages.AppendEntriesResponse;
 import com.redis.raft.RaftMessages.RequestVoteRequest;
@@ -8,6 +9,7 @@ import com.redis.raft.RaftMessages.RequestVoteResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +58,35 @@ public class RaftNode {
     private final List<String> peerIds; // every OTHER node in this Raft group (not including selfId)
     private final RaftLog log;
     private final CommandProcessor commandProcessor; // applies committed entries to this node's DataStore
+
+    // ===== Phase 7 client-wiring additions =====
+    // wal: this node's OWN local Write-Ahead Log (Phase 2). Note WHERE
+    // we log now, compared to Phase 1-6: back then, ClientHandler logged
+    // a write to the WAL BEFORE calling process() on it directly. Now,
+    // for a Raft-managed shard, a command isn't safe to treat as
+    // "happened" until it's COMMITTED (agreed by a majority) - logging
+    // it any earlier (e.g. the moment a leader merely receives it) could
+    // durably record something that a later leader's conflicting entry
+    // ends up truncating away, which would be a genuine correctness bug.
+    // So the WAL write now happens right here, in applyCommittedEntries,
+    // at the exact same moment we apply the command to DataStore - the
+    // same "log immediately before apply" invariant Phase 2 established,
+    // just moved to run at COMMIT time instead of RECEIPT time. This also
+    // means FOLLOWERS now get their own correct local WAL too (something
+    // Phase 6's ReplicaClient used to handle for replicas, but nothing
+    // was doing for Raft followers until now).
+    private final WriteAheadLog wal;
+
+    // appliedResults: remembers the CommandResult produced by applying
+    // each log index, so the client-facing networking layer (a leader
+    // that just called proposeCommand and is now WAITING for that
+    // specific index to commit) can retrieve the real result once it's
+    // ready, rather than having to re-run the command a second time
+    // (which would be actively wrong for something like an incrementing
+    // counter). We only ever need to look a FEW indexes back at once (one
+    // per currently-waiting client), so we periodically trim old entries
+    // below to stop this map from growing forever.
+    private final Map<Integer, CommandProcessor.CommandResult> appliedResults = new HashMap<>();
 
     // ===== Persistent-in-spirit Raft state =====
     // Real Raft requires these three to be written to disk BEFORE replying
@@ -108,11 +139,26 @@ public class RaftNode {
     // reads this to decide whether an election timeout has elapsed.
     private volatile long lastResetAt = System.currentTimeMillis();
 
+    /**
+     * Test-friendly constructor (no WAL) — used by RaftNodeTest, which
+     * builds these objects entirely in-memory with no real files
+     * involved. Mirrors the exact same "two-constructor, null means off"
+     * pattern CommandProcessor already uses for its own optional
+     * ClusterConfig — here, wal == null simply means "don't bother
+     * logging applied entries," which is fine for a throwaway test node
+     * that never restarts and needs no crash recovery.
+     */
     public RaftNode(String selfId, List<String> peerIds, RaftLog log, CommandProcessor commandProcessor) {
+        this(selfId, peerIds, log, commandProcessor, null);
+    }
+
+    public RaftNode(String selfId, List<String> peerIds, RaftLog log, CommandProcessor commandProcessor,
+                     WriteAheadLog wal) {
         this.selfId = selfId;
         this.peerIds = peerIds;
         this.log = log;
         this.commandProcessor = commandProcessor;
+        this.wal = wal;
     }
 
     // ==================== Simple state accessors ====================
@@ -480,17 +526,53 @@ public class RaftNode {
      * commitIndex advances: applies every not-yet-applied entry, in
      * order, to this node's own DataStore via CommandProcessor — the
      * exact same "apply a command" entry point used everywhere else in
-     * this project. We deliberately ignore the CommandResult here (no
-     * client is synchronously waiting on THIS specific call — the
-     * client-facing wiring, a later file, is responsible for tracking
-     * when ITS particular proposed command reaches commitIndex and
-     * replying to the client only then).
+     * this project. Also logs each entry to this node's own WAL first
+     * (if one was provided — see the constructor's javadoc above for
+     * why THIS is the correct moment to do that, not any earlier), and
+     * remembers the resulting CommandResult in appliedResults so a
+     * client-facing caller (ClientHandler, waiting on THIS specific
+     * index after calling proposeCommand) can retrieve it afterward.
      */
     private void applyCommittedEntries() {
         while (lastApplied < commitIndex) {
             lastApplied++;
             LogEntry entry = log.get(lastApplied);
-            commandProcessor.process(entry.command());
+
+            if (wal != null) {
+                try {
+                    wal.append(entry.command());
+                } catch (IOException e) {
+                    // Mirrors ClientHandler's own Phase 2/3 reasoning: if we
+                    // can't durably log it, we still choose to apply it here
+                    // (unlike a fresh client write, this command is ALREADY
+                    // committed — a majority of the group has it whether or
+                    // not THIS node's own disk cooperates) but we log the
+                    // failure loudly, since this node's own crash recovery
+                    // would otherwise silently miss this entry later.
+                    logger.error("Failed to write committed entry {} to local WAL: {}", lastApplied, e.getMessage());
+                }
+            }
+
+            CommandProcessor.CommandResult result = commandProcessor.process(entry.command());
+            appliedResults.put(lastApplied, result);
         }
+
+        // Bound appliedResults' size: nothing should ever need to look back
+        // further than a few entries (only an in-flight client wait would),
+        // so we drop anything older than that to stop this map growing
+        // forever over a long-running server's lifetime.
+        appliedResults.keySet().removeIf(index -> index < lastApplied - 1000);
+    }
+
+    /**
+     * Called by the client-facing networking layer after proposeCommand,
+     * repeatedly, until this returns non-null (meaning this node has now
+     * applied that index) or it gives up waiting. Synchronized because it
+     * reads appliedResults/lastApplied, the same fields applyCommittedEntries
+     * (also synchronized, since it's only ever called from within another
+     * synchronized method here) mutates.
+     */
+    public synchronized CommandProcessor.CommandResult getAppliedResult(int index) {
+        return appliedResults.get(index);
     }
 }

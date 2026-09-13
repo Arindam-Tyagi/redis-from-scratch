@@ -6,6 +6,10 @@ import com.redis.core.DataStore;
 import com.redis.network.Server;
 import com.redis.persistence.SnapshotManager;
 import com.redis.persistence.WriteAheadLog;
+import com.redis.raft.RaftLog;
+import com.redis.raft.RaftNode;
+import com.redis.raft.RaftTransport;
+import com.redis.raft.RaftTransport.PeerAddress;
 import com.redis.replication.ReplicaClient;
 import com.redis.replication.ReplicationManager;
 import com.redis.ttl.ExpiryManager;
@@ -16,8 +20,11 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
 
 /**
@@ -74,6 +81,13 @@ public class Main {
         // working exactly as before, unchanged.
         String role = config.getProperty("role", "primary").toLowerCase(Locale.ROOT);
         boolean isReplica = role.equals("replica");
+
+        // ===== Phase 7: is this node part of a Raft group? =====
+        // Every one of our 9 Phase 7 config files sets raft.self; nothing
+        // from Phase 1-6 ever did, so this flag is automatically false for
+        // any older, non-Raft config, keeping that old code path working
+        // unchanged for it.
+        boolean isRaftEnabled = config.getProperty("raft.self") != null;
 
         DataStore dataStore = new DataStore();
         SnapshotManager snapshotManager = new SnapshotManager(snapshotPath);
@@ -177,8 +191,66 @@ public class Main {
             Thread replicaThread = new Thread(replicaClient, "replica-client-thread");
             replicaThread.start();
             logger.info("Started replica-client thread targeting primary at {}:{}", masterHost, masterPort);
-        } else {
+        } else if (!isRaftEnabled) {
+            // A Raft-enabled node does NOT get a Phase 6 ReplicationManager
+            // at all - Raft's own AppendEntries replication supersedes it
+            // entirely within a shard. Building one anyway would leave a
+            // second, unused, completely redundant replication mechanism
+            // sitting on every node for no benefit.
             replicationManager = new ReplicationManager();
+        }
+
+        // ===== Phase 7: Raft group startup =====
+        // Builds this node's RaftNode (the pure state machine) and
+        // RaftTransport (the networking/timer layer that actually drives
+        // it), using the raft.self/raft.port/raft.peers keys every
+        // Phase 7 config file now carries. Started AFTER recovery, same
+        // reasoning as ExpiryManager above - Raft should only start
+        // participating in elections/replication once this node's own
+        // local state is fully reconstructed.
+        //
+        // KNOWN SIMPLIFICATION, worth calling out explicitly: RaftLog
+        // itself (like currentTerm/votedFor inside RaftNode) is kept
+        // purely in memory - it is NOT saved to disk and reloaded here.
+        // That means after a real restart, a node rejoins its group with
+        // an EMPTY Raft log, even though its DataStore/WAL may already
+        // reflect commands from before the restart. It will still catch
+        // up correctly via AppendEntries from the current leader for any
+        // command it's missing, but a fully rigorous implementation would
+        // persist the Raft log too, to avoid needlessly re-fetching
+        // history a node already durably had. Flagging this as a Phase 10
+        // hardening candidate, same as the other in-memory Raft state.
+        RaftNode raftNode = null;
+        RaftTransport raftTransport = null;
+        if (isRaftEnabled) {
+            String raftSelf = config.getProperty("raft.self");
+            int raftPort = Integer.parseInt(config.getProperty("raft.port"));
+            String raftPeersRaw = config.getProperty("raft.peers", "");
+
+            List<String> peerIds = new ArrayList<>();
+            Map<String, PeerAddress> peerAddresses = new LinkedHashMap<>();
+            if (!raftPeersRaw.isBlank()) {
+                // Each entry looks like "id:host:port" - split on ":" and
+                // take exactly 3 pieces. Splitting the whole comma-
+                // separated string first, then each piece individually,
+                // mirrors exactly how ClusterConfig.fromProperties already
+                // parses cluster.nodes back in Phase 5.
+                for (String entry : raftPeersRaw.split(",")) {
+                    String[] parts = entry.split(":");
+                    String peerId = parts[0];
+                    String peerHost = parts[1];
+                    int peerPort = Integer.parseInt(parts[2]);
+                    peerIds.add(peerId);
+                    peerAddresses.put(peerId, new PeerAddress(peerHost, peerPort));
+                }
+            }
+
+            RaftLog raftLog = new RaftLog();
+            raftNode = new RaftNode(raftSelf, peerIds, raftLog, commandProcessor, wal);
+            raftTransport = new RaftTransport(raftSelf, raftPort, raftNode, peerAddresses);
+            raftTransport.start();
+            logger.info("Raft node '{}' started on port {} with {} peer(s): {}",
+                    raftSelf, raftPort, peerIds.size(), peerIds);
         }
 
         // ===== Shutdown hook — a new JVM concept =====
@@ -194,9 +266,13 @@ public class Main {
         // work we've already done, only a nice-to-have for the CLEAN
         // shutdown case: it lets us close the WAL's file handle properly
         // rather than relying on the OS to clean it up eventually.
+        RaftTransport raftTransportForShutdown = raftTransport;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             logger.info("Shutting down — stopping active expiry and closing WAL file handle...");
             expiryManager.stop();
+            if (raftTransportForShutdown != null) {
+                raftTransportForShutdown.stop();
+            }
             try {
                 wal.close();
             } catch (IOException e) {
@@ -204,7 +280,7 @@ public class Main {
             }
         }));
 
-        Server server = new Server(port, commandProcessor, wal, dataStore, replicationManager);
+        Server server = new Server(port, commandProcessor, wal, dataStore, replicationManager, raftNode);
         logger.info("Starting server...");
         server.start(); // blocks forever — this call never normally returns
     }
