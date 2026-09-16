@@ -3,6 +3,7 @@ package com.redis;
 import com.redis.cluster.ClusterConfig;
 import com.redis.core.CommandProcessor;
 import com.redis.core.DataStore;
+import com.redis.dashboard.DashboardServer;
 import com.redis.network.Server;
 import com.redis.persistence.SnapshotManager;
 import com.redis.persistence.WriteAheadLog;
@@ -104,11 +105,16 @@ public class Main {
         // this project needs an optional feature (see CommandProcessor's
         // own ClusterConfig field, or Server's ReplicationManager field).
         CommandProcessor commandProcessor;
+        // Declared out here (not inside the else block below) so Phase 8's
+        // DashboardServer, further down, can also read this node's slot
+        // range - stays null for a replica, same "null means off" pattern
+        // as everywhere else.
+        ClusterConfig clusterConfig = null;
         if (isReplica) {
             commandProcessor = new CommandProcessor(dataStore);
             logger.info("Starting as a REPLICA node (role=replica)");
         } else {
-            ClusterConfig clusterConfig = ClusterConfig.fromProperties(config);
+            clusterConfig = ClusterConfig.fromProperties(config);
             ClusterConfig.NodeInfo self = clusterConfig.self();
             logger.info("Cluster node '{}' owns slots {}-{} ({}:{})",
                     self.id(), self.slotStart(), self.slotEnd(), self.host(), self.port());
@@ -253,6 +259,25 @@ public class Main {
                     raftSelf, raftPort, peerIds.size(), peerIds);
         }
 
+        // ===== Phase 8: dashboard HTTP server =====
+        // Started on EVERY node (not gated behind isRaftEnabled or any
+        // other flag) - even a node with no RaftNode/ClusterConfig would
+        // still serve a (mostly-empty) status page, matching the "null
+        // means off, don't crash" pattern DashboardServer itself already
+        // follows internally. Optional in config: only started if
+        // dashboard.port is actually present, so older/non-dashboard
+        // configs need no changes at all.
+        DashboardServer dashboardServer = null;
+        String dashboardPortProperty = config.getProperty("dashboard.port");
+        if (dashboardPortProperty != null) {
+            int dashboardPort = Integer.parseInt(dashboardPortProperty);
+            Path dashboardHtmlPath = Path.of(config.getProperty("dashboard.html.path", "dashboard/dashboard.html"));
+            dashboardServer = new DashboardServer(dashboardPort, port, raftNode, clusterConfig, dataStore,
+                    commandProcessor, wal, snapshotPath, dashboardHtmlPath);
+            dashboardServer.start();
+            logger.info("Dashboard available at http://localhost:{}/", dashboardPort);
+        }
+
         // ===== Shutdown hook — a new JVM concept =====
         // Runtime.getRuntime().addShutdownHook(thread) registers a Thread
         // that the JVM will automatically start and wait for whenever the
@@ -267,11 +292,15 @@ public class Main {
         // shutdown case: it lets us close the WAL's file handle properly
         // rather than relying on the OS to clean it up eventually.
         RaftTransport raftTransportForShutdown = raftTransport;
+        DashboardServer dashboardServerForShutdown = dashboardServer;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             logger.info("Shutting down — stopping active expiry and closing WAL file handle...");
             expiryManager.stop();
             if (raftTransportForShutdown != null) {
                 raftTransportForShutdown.stop();
+            }
+            if (dashboardServerForShutdown != null) {
+                dashboardServerForShutdown.stop();
             }
             try {
                 wal.close();

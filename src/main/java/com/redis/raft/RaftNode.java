@@ -10,6 +10,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -87,6 +90,28 @@ public class RaftNode {
     // per currently-waiting client), so we periodically trim old entries
     // below to stop this map from growing forever.
     private final Map<Integer, CommandProcessor.CommandResult> appliedResults = new HashMap<>();
+
+    // ===== Dashboard addition: a REAL, queryable event history =====
+    // Every event below was already being announced via logger.info(...)
+    // - that's fine for a human tailing a log file, but useless for a
+    // dashboard to QUERY. RaftEvent + recordEvent() turn those same real
+    // moments into small structured records a caller can retrieve later
+    // (via getRecentEvents()) - genuinely recorded at the instant each
+    // thing actually happens, never fabricated after the fact for
+    // display purposes. Capped at MAX_EVENTS so a long-running node
+    // doesn't grow this list forever.
+    public record RaftEvent(long timestampMillis, String message) {
+    }
+
+    private static final int MAX_EVENTS = 50;
+    private final Deque<RaftEvent> recentEvents = new ArrayDeque<>();
+
+    private void recordEvent(String message) {
+        recentEvents.addFirst(new RaftEvent(System.currentTimeMillis(), message));
+        while (recentEvents.size() > MAX_EVENTS) {
+            recentEvents.removeLast();
+        }
+    }
 
     // ===== Persistent-in-spirit Raft state =====
     // Real Raft requires these three to be written to disk BEFORE replying
@@ -191,6 +216,49 @@ public class RaftNode {
         return lastResetAt;
     }
 
+    // ===== Dashboard introspection getters (Raft Monitor section) =====
+    // All synchronized for the same reason every other accessor above is:
+    // these fields are mutated from RaftTransport's timer thread and read
+    // from the dashboard's own HTTP handler thread concurrently.
+
+    public synchronized int getCommitIndex() {
+        return commitIndex;
+    }
+
+    public synchronized int getLastApplied() {
+        return lastApplied;
+    }
+
+    public int getLogSize() {
+        return log.size(); // RaftLog itself is already synchronized internally
+    }
+
+    /**
+     * Leader-only: this leader's current belief about each peer's
+     * replication progress. Returns an EMPTY map (never null) when this
+     * node isn't currently leader - nextIndex/matchIndex are only
+     * meaningful for a leader (see the class-level comment on those
+     * fields), and an empty map is simpler for a caller to handle than a
+     * null check.
+     */
+    public synchronized Map<String, Integer> getMatchIndexSnapshot() {
+        return matchIndex != null ? new HashMap<>(matchIndex) : Map.of();
+    }
+
+    public synchronized Map<String, Integer> getNextIndexSnapshot() {
+        return nextIndex != null ? new HashMap<>(nextIndex) : Map.of();
+    }
+
+    /**
+     * A copy of this node's recent real event history, most recent
+     * first - see the RaftEvent/recordEvent explanation above the field
+     * declarations for why these are genuine recorded events, not
+     * generated on demand for display.
+     */
+    public synchronized List<RaftEvent> getRecentEvents() {
+        return new ArrayList<>(recentEvents);
+    }
+
     private void resetElectionTimer() {
         lastResetAt = System.currentTimeMillis();
     }
@@ -244,6 +312,7 @@ public class RaftNode {
             votedFor = request.candidateId();
             resetElectionTimer(); // granting a vote is a reason to not also start our own election right now
             logger.info("Voted for {} in term {}", request.candidateId(), currentTerm);
+            recordEvent("Voted for '" + request.candidateId() + "' in term " + currentTerm);
             return new RequestVoteResponse(currentTerm, true);
         }
 
@@ -338,9 +407,13 @@ public class RaftNode {
      * follower no matter what role we held a moment ago.
      */
     private void stepDownToFollower(long newTerm) {
+        boolean wasLeaderOrCandidate = role == Role.LEADER || role == Role.CANDIDATE;
         currentTerm = newTerm;
         votedFor = null;
         role = Role.FOLLOWER;
+        if (wasLeaderOrCandidate) {
+            recordEvent("Stepped down to FOLLOWER (saw higher term " + newTerm + ")");
+        }
     }
 
     // ==================== Starting and running an election ====================
@@ -361,6 +434,7 @@ public class RaftNode {
         votesReceived = 1; // we always vote for ourselves
         resetElectionTimer();
         logger.info("Starting election for term {}", currentTerm);
+        recordEvent("Started election for term " + currentTerm);
         return new RequestVoteRequest(currentTerm, selfId, log.lastIndex(), log.lastTerm());
     }
 
@@ -402,6 +476,7 @@ public class RaftNode {
             matchIndex.put(peerId, 0);
         }
         logger.info("Became LEADER for term {}", currentTerm);
+        recordEvent("Became LEADER for term " + currentTerm);
     }
 
     // ==================== Leader: proposing new commands ====================
@@ -521,6 +596,7 @@ public class RaftNode {
             int majority = (peerIds.size() + 1) / 2 + 1;
             if (replicatedCount >= majority) {
                 commitIndex = candidateIndex;
+                recordEvent("Entry " + candidateIndex + " committed (majority: " + replicatedCount + "/" + (peerIds.size() + 1) + ")");
                 applyCommittedEntries();
                 return; // candidateIndex is the HIGHEST such index by construction (we walked downward), so we're done
             }

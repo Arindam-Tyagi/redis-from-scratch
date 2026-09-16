@@ -110,6 +110,15 @@ public class WriteAheadLog {
      */
     private final ReentrantLock lock = new ReentrantLock();
 
+    // ===== Dashboard introspection (Persistence section) =====
+    // Seeded once at construction by counting whatever's already in the
+    // file (a real, on-disk count, not a guess), then incremented on
+    // every successful append() from that point on — so this stays a
+    // genuine running total across the WAL's whole lifetime, not just
+    // "since this process started."
+    private volatile long entryCount;
+    private volatile long lastWriteAtMillis = -1;
+
     /**
      * @param filePath where the WAL file lives on disk, e.g.
      *                 Path.of("wal/node1.wal") — matches the wal/ folder
@@ -136,6 +145,11 @@ public class WriteAheadLog {
         // one of the most important single characters in this whole file.
         this.fileOut = new FileOutputStream(filePath.toFile(), true);
         this.out = new DataOutputStream(this.fileOut);
+
+        // Seed entryCount from whatever's ALREADY durably on disk (e.g.
+        // from a previous run) - readAll() is only ever this expensive
+        // ONE time, here at startup, never again during normal operation.
+        this.entryCount = readAll().size();
     }
 
     /**
@@ -206,9 +220,20 @@ public class WriteAheadLog {
             // use the simpler, more direct getFD().sync() here since we
             // don't need any other FileChannel features in this class.)
             fileOut.getFD().sync();
+            entryCount++;
+            lastWriteAtMillis = System.currentTimeMillis();
         } finally {
             lock.unlock();
         }
+    }
+
+    public long getEntryCount() {
+        return entryCount;
+    }
+
+    /** -1 means no write has happened yet this run (and none was ever recorded before this run's startup count either, for a brand new WAL). */
+    public long getLastWriteAtMillis() {
+        return lastWriteAtMillis;
     }
 
     /**
@@ -350,6 +375,7 @@ public class WriteAheadLog {
             out.close(); // release the old file handle first
             this.fileOut = new FileOutputStream(filePath.toFile(), false);
             this.out = new DataOutputStream(this.fileOut);
+            entryCount = 0; // the file's now genuinely empty - keep this counter honest
         } finally {
             lock.unlock();
         }

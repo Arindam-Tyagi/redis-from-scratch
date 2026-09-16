@@ -10,6 +10,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * CommandProcessor is the "brain" that sits between whatever brings in a
@@ -32,6 +33,22 @@ import java.util.Set;
 public class CommandProcessor {
 
     private final DataStore dataStore;
+
+    // ===== Dashboard introspection: a real, live command counter =====
+    // AtomicLong - a new concept: a Long whose increment (getAndIncrement)
+    // is a single indivisible ("atomic") operation, safe to call from many
+    // client-handler virtual threads at once with no separate lock needed
+    // (a plain `long commandCount++` is NOT safe under concurrent access -
+    // "++" is actually 3 separate steps - read, add one, write back - and
+    // two threads interleaving those steps can silently lose an
+    // increment). DashboardServer samples this counter twice, one second
+    // apart, and reports the DIFFERENCE as "commands/sec" - a real
+    // measured rate, not an estimate.
+    private final AtomicLong commandCount = new AtomicLong(0);
+
+    public long getCommandCount() {
+        return commandCount.get();
+    }
 
     /**
      * The cluster's topology and this node's place in it (Phase 5) — or
@@ -124,6 +141,7 @@ public class CommandProcessor {
         if (args == null || args.isEmpty()) {
             return CommandResult.error("ERR empty command");
         }
+        commandCount.incrementAndGet();
 
         // Redis commands are case-insensitive ("set", "SET", "SeT" all work),
         // so we normalize to uppercase once, here, rather than making every
